@@ -6,9 +6,13 @@ Scrapes business listings from Google Maps based on city, country, and
 search query. Uses Playwright under the hood via crawl4ai's AsyncWebCrawler
 with VirtualScrollConfig for infinite-scroll handling.
 
-Usage:
+Usage (single search):
     python scraper.py --city "Guadalajara" --country "Mexico" --query "auto repair"
     python scraper.py --city "NYC" --country "USA" --query "coffee shop" --max-results 50
+
+Usage (grid search – covers the whole city):
+    python scraper.py --grid --preset-city guadalajara --query "reparacion automotriz"
+    python scraper.py --grid --bbox 20.55 20.75 -103.45 -103.20 --query "taller mecanico" --zoom 14 --rows 8 --cols 10
 """
 
 import asyncio
@@ -19,7 +23,7 @@ import logging
 import re
 import random
 from dataclasses import dataclass, asdict
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Iterator, Tuple
 from urllib.parse import quote
 
 from bs4 import BeautifulSoup
@@ -350,6 +354,41 @@ def has_reached_end_of_list(html: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Geographic grid support
+# ---------------------------------------------------------------------------
+
+CITY_BBOXES: Dict[str, Dict[str, float]] = {
+    "guadalajara": {"lat_min": 20.55, "lat_max": 20.75, "lon_min": -103.45, "lon_max": -103.20},
+    "monterrey":   {"lat_min": 25.55, "lat_max": 25.85, "lon_min": -100.45, "lon_max": -100.20},
+    "mexico city": {"lat_min": 19.25, "lat_max": 19.60, "lon_min": -99.30,  "lon_max": -98.95},
+    "tijuana":     {"lat_min": 32.40, "lat_max": 32.60, "lon_min": -117.15, "lon_max": -116.85},
+    "puebla":      {"lat_min": 18.95, "lat_max": 19.15, "lon_min": -98.30,  "lon_max": -98.10},
+}
+
+
+def generate_grid_cells(
+    lat_min: float,
+    lat_max: float,
+    lon_min: float,
+    lon_max: float,
+    rows: int,
+    cols: int,
+) -> Iterator[Tuple[float, float]]:
+    """
+    Yield (center_lat, center_lng) for each cell in a rows×cols grid
+    covering the given bounding box, in row-major order (top-to-bottom,
+    left-to-right).
+    """
+    lat_step = (lat_max - lat_min) / rows
+    lon_step = (lon_max - lon_min) / cols
+    for row in range(rows):
+        for col in range(cols):
+            center_lat = lat_max - (row + 0.5) * lat_step
+            center_lng = lon_min + (col + 0.5) * lon_step
+            yield center_lat, center_lng
+
+
+# ---------------------------------------------------------------------------
 # Scraper class
 # ---------------------------------------------------------------------------
 
@@ -365,6 +404,11 @@ class GoogleMapsScraper:
     4. If VirtualScrollConfig did not yield enough results, fall back to a
        manual JS-scroll loop using session_id + js_only=True.
     5. Parse the HTML snapshots with BeautifulSoup after each phase.
+
+    Grid mode
+    ---------
+    scrape_grid() divides a bounding box into tiles and calls _scrape_single_tile()
+    for each one, sharing a single browser session and seen_keys set across all tiles.
     """
 
     # How many consecutive scroll steps with zero new results before giving up
@@ -415,60 +459,100 @@ class GoogleMapsScraper:
             verbose=False,
             viewport_width=1280,
             viewport_height=900,
-            enable_stealth=True,    # Reduces bot-detection fingerprinting
+            enable_stealth=True,
+        )
+
+        seen_keys: set = set()
+        async with AsyncWebCrawler(config=browser_cfg) as crawler:
+            businesses = await self._scrape_single_tile(crawler, search_url, seen_keys)
+
+        logger.info("=== Scraping complete – %d businesses collected ===", len(businesses))
+        return businesses
+
+    async def scrape_grid(
+        self,
+        query: str,
+        lat_min: float,
+        lat_max: float,
+        lon_min: float,
+        lon_max: float,
+        rows: int = 8,
+        cols: int = 10,
+        zoom: int = 14,
+    ) -> List[BusinessInfo]:
+        """
+        Scrape Google Maps using a grid of coordinate-anchored tiles.
+
+        Divides the bounding box into rows×cols cells and scrapes each one
+        separately, sharing a single browser session and seen_keys set so
+        businesses that appear in multiple tiles are counted only once.
+
+        Args:
+            query:   Raw search term, e.g. "reparacion automotriz".
+            lat_min: Southern latitude boundary.
+            lat_max: Northern latitude boundary.
+            lon_min: Western longitude boundary.
+            lon_max: Eastern longitude boundary.
+            rows:    Number of grid rows (north-to-south divisions).
+            cols:    Number of grid columns (west-to-east divisions).
+            zoom:    Google Maps zoom level (13 ≈ 5 km, 14 ≈ 2.5 km visible diameter).
+
+        Returns:
+            Deduplicated list of BusinessInfo objects from all tiles.
+        """
+        import time
+
+        total_tiles = rows * cols
+        logger.info("=== Grid Scraper starting ===")
+        logger.info("Query : %s", query)
+        logger.info("BBox  : lat [%.4f, %.4f]  lon [%.4f, %.4f]", lat_min, lat_max, lon_min, lon_max)
+        logger.info("Grid  : %d rows × %d cols = %d tiles  (zoom %d)", rows, cols, total_tiles, zoom)
+
+        browser_cfg = BrowserConfig(
+            headless=self.headless,
+            verbose=False,
+            viewport_width=1280,
+            viewport_height=900,
+            enable_stealth=True,
         )
 
         businesses: List[BusinessInfo] = []
         seen_keys: set = set()
+        start_time = time.monotonic()
 
         async with AsyncWebCrawler(config=browser_cfg) as crawler:
-            # ── Phase 1: Initial page load ─────────────────────────────────
-            logger.info("Phase 1 – Loading page and auto-scrolling via VirtualScrollConfig …")
-
-            virtual_scroll = VirtualScrollConfig(
-                container_selector='div[role="feed"]',
-                scroll_count=self.max_scroll_steps,
-                scroll_by="container_height",
-                wait_after_scroll=self.scroll_wait,
-            )
-
-            init_cfg = CrawlerRunConfig(
-                session_id=self._session_id,
-                wait_for='css:div[role="feed"]',
-                js_code=[JS_DISMISS_CONSENT, JS_CLOSE_OVERLAYS],
-                virtual_scroll_config=virtual_scroll,
-                magic=True,
-                simulate_user=True,
-                override_navigator=True,
-                remove_consent_popups=True,
-                cache_mode=CacheMode.BYPASS,   # Always fetch fresh
-                page_timeout=60_000,
-                delay_before_return_html=1.5,
-                verbose=False,
-            )
-
-            result = await crawler.arun(url=search_url, config=init_cfg)
-
-            if not result.success:
-                logger.error("Failed to load page: %s", result.error_message)
-                return businesses
-
-            # Parse the snapshot returned after auto-scrolling
-            new = extract_businesses_from_html(result.html, seen_keys)
-            businesses.extend(new)
-            logger.info("Phase 1 complete – %d businesses collected so far.", len(businesses))
-
-            # ── Phase 2: Manual JS-scroll fallback loop ────────────────────
-            # If Phase 1 already reached the end or the limit, skip.
-            if not self._should_continue(businesses, result.html):
-                logger.info("Phase 1 collected all available results. Skipping Phase 2.")
-            else:
-                logger.info("Phase 2 – Manual scroll loop to catch remaining results …")
-                businesses = await self._manual_scroll_loop(
-                    crawler, search_url, businesses, seen_keys
+            for tile_num, (center_lat, center_lng) in enumerate(
+                generate_grid_cells(lat_min, lat_max, lon_min, lon_max, rows, cols), 1
+            ):
+                tile_url = self._build_grid_url(center_lat, center_lng, zoom, query)
+                logger.info(
+                    "── Tile %d/%d  (%.5f, %.5f)  unique so far: %d",
+                    tile_num, total_tiles, center_lat, center_lng, len(businesses),
                 )
 
-        logger.info("=== Scraping complete – %d businesses collected ===", len(businesses))
+                new = await self._scrape_single_tile(crawler, tile_url, seen_keys)
+                businesses.extend(new)
+
+                elapsed = time.monotonic() - start_time
+                avg = elapsed / tile_num
+                eta_min = avg * (total_tiles - tile_num) / 60
+                logger.info(
+                    "   +%d nuevos | total: %d | ETA: ~%.0f min",
+                    len(new), len(businesses), eta_min,
+                )
+
+                if self.max_results and len(businesses) >= self.max_results:
+                    businesses = businesses[: self.max_results]
+                    logger.info("Reached max_results (%d) – stopping grid.", self.max_results)
+                    break
+
+                # Polite inter-tile pause to reduce bot-detection risk
+                await asyncio.sleep(random.uniform(1.0, 2.5))
+
+        logger.info(
+            "=== Grid complete – %d unique businesses across %d/%d tiles ===",
+            len(businesses), tile_num, total_tiles,
+        )
         return businesses
 
     # ------------------------------------------------------------------
@@ -477,9 +561,14 @@ class GoogleMapsScraper:
 
     @staticmethod
     def _build_url(city: str, country: str, query: str) -> str:
-        """Construct the Google Maps search URL."""
+        """Construct the Google Maps search URL for a city/country query."""
         full_query = f"{query} in {city}, {country}"
         return f"https://www.google.com/maps/search/{quote(full_query)}"
+
+    @staticmethod
+    def _build_grid_url(lat: float, lng: float, zoom: int, query: str) -> str:
+        """Construct a Google Maps search URL anchored to specific coordinates."""
+        return f"https://www.google.com/maps/search/{quote(query)}/@{lat:.6f},{lng:.6f},{zoom}z"
 
     def _should_continue(self, businesses: List[BusinessInfo], html: str) -> bool:
         """Return False when we have enough results or hit the last page."""
@@ -488,6 +577,72 @@ class GoogleMapsScraper:
         if has_reached_end_of_list(html):
             return False
         return True
+
+    async def _scrape_single_tile(
+        self,
+        crawler: AsyncWebCrawler,
+        tile_url: str,
+        seen_keys: set,
+    ) -> List[BusinessInfo]:
+        """
+        Run Phase 1 (VirtualScrollConfig) + Phase 2 (manual JS-scroll fallback)
+        for a single URL inside an already-open crawler session.
+
+        Args:
+            crawler:   Active AsyncWebCrawler context (browser already open).
+            tile_url:  URL to load for this tile.
+            seen_keys: Shared deduplication set, mutated in-place.
+
+        Returns:
+            List of new BusinessInfo objects found in this tile.
+        """
+        tile_businesses: List[BusinessInfo] = []
+
+        # ── Phase 1: Load page with VirtualScrollConfig ───────────────────
+        logger.info("Phase 1 – Loading and auto-scrolling via VirtualScrollConfig …")
+
+        virtual_scroll = VirtualScrollConfig(
+            container_selector='div[role="feed"]',
+            scroll_count=self.max_scroll_steps,
+            scroll_by="container_height",
+            wait_after_scroll=self.scroll_wait,
+        )
+
+        init_cfg = CrawlerRunConfig(
+            session_id=self._session_id,
+            wait_for='css:div[role="feed"]',
+            js_code=[JS_DISMISS_CONSENT, JS_CLOSE_OVERLAYS],
+            virtual_scroll_config=virtual_scroll,
+            magic=True,
+            simulate_user=True,
+            override_navigator=True,
+            remove_consent_popups=True,
+            cache_mode=CacheMode.BYPASS,
+            page_timeout=60_000,
+            delay_before_return_html=1.5,
+            verbose=False,
+        )
+
+        result = await crawler.arun(url=tile_url, config=init_cfg)
+
+        if not result.success:
+            logger.warning("Tile load failed: %s", result.error_message)
+            return tile_businesses  # skip this tile gracefully
+
+        new = extract_businesses_from_html(result.html, seen_keys)
+        tile_businesses.extend(new)
+        logger.info("Phase 1 complete – %d businesses collected so far.", len(tile_businesses))
+
+        # ── Phase 2: Manual JS-scroll fallback ───────────────────────────
+        if not self._should_continue(tile_businesses, result.html):
+            logger.info("Phase 1 collected all available results. Skipping Phase 2.")
+        else:
+            logger.info("Phase 2 – Manual scroll loop to catch remaining results …")
+            tile_businesses = await self._manual_scroll_loop(
+                crawler, tile_url, tile_businesses, seen_keys
+            )
+
+        return tile_businesses
 
     async def _manual_scroll_loop(
         self,
@@ -597,7 +752,7 @@ def save_to_csv(businesses: List[BusinessInfo], filepath: str = "results.csv") -
 
 
 # ---------------------------------------------------------------------------
-# Top-level async entry point
+# Top-level async entry points
 # ---------------------------------------------------------------------------
 
 def build_output_filename(city: str, country: str, search_query: str, ext: str) -> str:
@@ -617,6 +772,18 @@ def build_output_filename(city: str, country: str, search_query: str, ext: str) 
     return name
 
 
+def build_grid_output_filename(search_query: str, ext: str) -> str:
+    """Build output filename for grid mode: <query>_grid_<date>.<ext>"""
+    def slug(s: str) -> str:
+        s = s.lower().strip()
+        s = re.sub(r"[^\w\s-]", "", s)
+        s = re.sub(r"[\s]+", "_", s)
+        return s
+
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    return f"{slug(search_query)}_grid_{date_str}.{ext}"
+
+
 async def run_scraper(
     city: str,
     country: str,
@@ -631,18 +798,6 @@ async def run_scraper(
 
     Output filenames default to  <query>_<city>_<country>_<YYYY-MM-DD>.{json,csv}
     when not specified explicitly.
-
-    Args:
-        city:          City name (e.g. "Guadalajara").
-        country:       Country name (e.g. "Mexico").
-        search_query:  What to look for (e.g. "auto repair").
-        max_results:   Cap on total results; None means no cap.
-        headless:      Whether to run the browser in headless mode.
-        output_json:   Path for the JSON output file (auto-generated if None).
-        output_csv:    Path for the CSV output file (auto-generated if None).
-
-    Returns:
-        List of BusinessInfo objects that were collected and saved.
     """
     if output_json is None:
         output_json = build_output_filename(city, country, search_query, "json")
@@ -669,6 +824,55 @@ async def run_scraper(
     return businesses
 
 
+async def run_scraper_grid(
+    query: str,
+    lat_min: float,
+    lat_max: float,
+    lon_min: float,
+    lon_max: float,
+    rows: int = 8,
+    cols: int = 10,
+    zoom: int = 14,
+    max_results: Optional[int] = None,
+    headless: bool = True,
+    output_json: Optional[str] = None,
+    output_csv: Optional[str] = None,
+) -> List[BusinessInfo]:
+    """
+    Convenience wrapper for grid scraping: scrape and save results.
+
+    Output filenames default to <query>_grid_<YYYY-MM-DD>.{json,csv}.
+    """
+    if output_json is None:
+        output_json = build_grid_output_filename(query, "json")
+    if output_csv is None:
+        output_csv = build_grid_output_filename(query, "csv")
+
+    scraper = GoogleMapsScraper(
+        headless=headless,
+        max_results=max_results,
+    )
+
+    businesses = await scraper.scrape_grid(
+        query=query,
+        lat_min=lat_min,
+        lat_max=lat_max,
+        lon_min=lon_min,
+        lon_max=lon_max,
+        rows=rows,
+        cols=cols,
+        zoom=zoom,
+    )
+
+    if businesses:
+        save_to_json(businesses, output_json)
+        save_to_csv(businesses, output_csv)
+    else:
+        logger.warning("No businesses found – output files not written.")
+
+    return businesses
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -680,31 +884,86 @@ if __name__ == "__main__":
         description="Scrape Google Maps business listings with crawl4ai.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--city",        required=True, help="City to search in")
-    parser.add_argument("--country",     required=True, help="Country to search in")
-    parser.add_argument("--query",       required=True, help='Search query, e.g. "auto repair"')
+
+    # ── Shared args ──────────────────────────────────────────────────────
+    parser.add_argument("--query",       required=True, help='Search query, e.g. "reparacion automotriz"')
     parser.add_argument("--max-results", type=int, default=None,
                         help="Maximum number of businesses to collect (unlimited by default)")
     parser.add_argument("--no-headless", action="store_true",
                         help="Show the browser window (useful for debugging)")
     parser.add_argument("--output-json", default=None,
-                        help="Path for JSON output (default: <query>_<city>_<country>_<date>.json)")
+                        help="Path for JSON output (auto-generated if omitted)")
     parser.add_argument("--output-csv",  default=None,
-                        help="Path for CSV output  (default: <query>_<city>_<country>_<date>.csv)")
+                        help="Path for CSV output  (auto-generated if omitted)")
+
+    # ── Single-search args (original mode) ───────────────────────────────
+    parser.add_argument("--city",    default=None, help="City to search in  [single mode]")
+    parser.add_argument("--country", default=None, help="Country to search in  [single mode]")
+
+    # ── Grid-search args ─────────────────────────────────────────────────
+    parser.add_argument("--grid", action="store_true",
+                        help="Enable grid mode: divide the city into tiles and scrape each one")
+    parser.add_argument("--preset-city", default=None,
+                        choices=list(CITY_BBOXES.keys()),
+                        metavar="CITY",
+                        help=(
+                            "Use a predefined bounding box for this city. "
+                            f"Available: {', '.join(CITY_BBOXES.keys())}"
+                        ))
+    parser.add_argument("--bbox", nargs=4, type=float,
+                        metavar=("LAT_MIN", "LAT_MAX", "LON_MIN", "LON_MAX"),
+                        help="Custom bounding box. Overrides --preset-city.")
+    parser.add_argument("--rows", type=int, default=8,
+                        help="Grid rows – north-to-south divisions  [grid mode]")
+    parser.add_argument("--cols", type=int, default=10,
+                        help="Grid columns – west-to-east divisions  [grid mode]")
+    parser.add_argument("--zoom", type=int, default=14,
+                        help="Google Maps zoom level (13≈5km, 14≈2.5km visible diameter)  [grid mode]")
 
     args = parser.parse_args()
 
-    results = asyncio.run(
-        run_scraper(
-            city=args.city,
-            country=args.country,
-            search_query=args.query,
-            max_results=args.max_results,
-            headless=not args.no_headless,
-            output_json=args.output_json,
-            output_csv=args.output_csv,
+    if args.grid:
+        # Resolve bounding box: --bbox takes priority over --preset-city
+        if args.bbox:
+            lat_min, lat_max, lon_min, lon_max = args.bbox
+        elif args.preset_city:
+            bb = CITY_BBOXES[args.preset_city]
+            lat_min, lat_max = bb["lat_min"], bb["lat_max"]
+            lon_min, lon_max = bb["lon_min"], bb["lon_max"]
+        else:
+            parser.error("--grid requires either --preset-city or --bbox.")
+
+        results = asyncio.run(
+            run_scraper_grid(
+                query=args.query,
+                lat_min=lat_min,
+                lat_max=lat_max,
+                lon_min=lon_min,
+                lon_max=lon_max,
+                rows=args.rows,
+                cols=args.cols,
+                zoom=args.zoom,
+                max_results=args.max_results,
+                headless=not args.no_headless,
+                output_json=args.output_json,
+                output_csv=args.output_csv,
+            )
         )
-    )
+    else:
+        if not args.city or not args.country:
+            parser.error("Single mode requires --city and --country (or use --grid for grid mode).")
+
+        results = asyncio.run(
+            run_scraper(
+                city=args.city,
+                country=args.country,
+                search_query=args.query,
+                max_results=args.max_results,
+                headless=not args.no_headless,
+                output_json=args.output_json,
+                output_csv=args.output_csv,
+            )
+        )
 
     print(f"\n{'='*50}")
     print(f"  Total businesses scraped: {len(results)}")
