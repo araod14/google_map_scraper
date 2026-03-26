@@ -358,11 +358,27 @@ def has_reached_end_of_list(html: str) -> bool:
 # ---------------------------------------------------------------------------
 
 CITY_BBOXES: Dict[str, Dict[str, float]] = {
-    "guadalajara": {"lat_min": 20.55, "lat_max": 20.75, "lon_min": -103.45, "lon_max": -103.20},
-    "monterrey":   {"lat_min": 25.55, "lat_max": 25.85, "lon_min": -100.45, "lon_max": -100.20},
-    "mexico city": {"lat_min": 19.25, "lat_max": 19.60, "lon_min": -99.30,  "lon_max": -98.95},
-    "tijuana":     {"lat_min": 32.40, "lat_max": 32.60, "lon_min": -117.15, "lon_max": -116.85},
-    "puebla":      {"lat_min": 18.95, "lat_max": 19.15, "lon_min": -98.30,  "lon_max": -98.10},
+    "guadalajara":     {"lat_min": 20.55, "lat_max": 20.75, "lon_min": -103.45, "lon_max": -103.20},
+    "monterrey":       {"lat_min": 25.55, "lat_max": 25.85, "lon_min": -100.45, "lon_max": -100.20},
+    "mexico city":     {"lat_min": 19.25, "lat_max": 19.60, "lon_min": -99.30,  "lon_max": -98.95},
+    "ciudad de mexico":{"lat_min": 19.25, "lat_max": 19.60, "lon_min": -99.30,  "lon_max": -98.95},
+    "tijuana":         {"lat_min": 32.40, "lat_max": 32.60, "lon_min": -117.15, "lon_max": -116.85},
+    "puebla":          {"lat_min": 18.95, "lat_max": 19.15, "lon_min": -98.30,  "lon_max": -98.10},
+    "toluca":          {"lat_min": 19.22, "lat_max": 19.38, "lon_min": -99.75,  "lon_max": -99.57},
+    "leon":            {"lat_min": 21.03, "lat_max": 21.20, "lon_min": -101.75, "lon_max": -101.55},
+    "juarez":          {"lat_min": 31.60, "lat_max": 31.80, "lon_min": -106.55, "lon_max": -106.35},
+    "torreon":         {"lat_min": 25.45, "lat_max": 25.65, "lon_min": -103.55, "lon_max": -103.35},
+    "queretaro":       {"lat_min": 20.52, "lat_max": 20.68, "lon_min": -100.45, "lon_max": -100.30},
+    "san luis potosi": {"lat_min": 22.08, "lat_max": 22.22, "lon_min": -101.08, "lon_max": -100.92},
+    "merida":          {"lat_min": 20.90, "lat_max": 21.05, "lon_min": -89.70,  "lon_max": -89.55},
+    "mexicali":        {"lat_min": 32.55, "lat_max": 32.72, "lon_min": -115.55, "lon_max": -115.38},
+    "aguascalientes":  {"lat_min": 21.82, "lat_max": 21.97, "lon_min": -102.35, "lon_max": -102.20},
+    "cuernavaca":      {"lat_min": 18.87, "lat_max": 19.02, "lon_min": -99.30,  "lon_max": -99.18},
+    "saltillo":        {"lat_min": 25.35, "lat_max": 25.55, "lon_min": -101.10, "lon_max": -100.92},
+    "hermosillo":      {"lat_min": 29.02, "lat_max": 29.18, "lon_min": -111.08, "lon_max": -110.90},
+    "culiacan":        {"lat_min": 24.74, "lat_max": 24.88, "lon_min": -107.50, "lon_max": -107.35},
+    "chihuahua":       {"lat_min": 28.58, "lat_max": 28.75, "lon_min": -106.15, "lon_max": -105.97},
+    "morelia":         {"lat_min": 19.65, "lat_max": 19.78, "lon_min": -101.25, "lon_max": -101.10},
 }
 
 
