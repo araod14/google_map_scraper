@@ -58,6 +58,8 @@ class BusinessInfo:
     phone: Optional[str] = None
     website: Optional[str] = None
     google_maps_url: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -244,6 +246,25 @@ def _parse_website(element) -> Optional[str]:
     return None
 
 
+def _parse_coords_from_url(url: str) -> tuple[Optional[float], Optional[float]]:
+    """Extract (latitude, longitude) from a Google Maps place URL.
+
+    Tries two patterns in order:
+      1. ``@lat,lng,zoom``  – present in the URL path for most results.
+      2. ``!3d{lat}!4d{lng}`` – encoded in the data segment as fallback.
+    """
+    m = re.search(r"@(-?\d+\.\d+),(-?\d+\.\d+)", url)
+    if m:
+        return float(m.group(1)), float(m.group(2))
+
+    lat_m = re.search(r"!3d(-?\d+\.\d+)", url)
+    lng_m = re.search(r"!4d(-?\d+\.\d+)", url)
+    if lat_m and lng_m:
+        return float(lat_m.group(1)), float(lng_m.group(1))
+
+    return None, None
+
+
 def parse_business_card(card_element) -> Optional[BusinessInfo]:
     """
     Parse a single <div role="article"> or equivalent card element.
@@ -272,12 +293,14 @@ def parse_business_card(card_element) -> Optional[BusinessInfo]:
             if anchor and anchor.get("aria-label"):
                 biz.name = anchor["aria-label"].strip()
 
-        # --- Google Maps URL ------------------------------------------------
+        # --- Google Maps URL + coordinates ----------------------------------
         anchor = card_element.find("a", href=re.compile(r"/maps/place/"))
         if anchor:
             href = anchor.get("href", "")
-            # Keep only the canonical place path, drop query params
-            biz.google_maps_url = re.sub(r"\?.*$", "", href) if href else None
+            if href:
+                biz.latitude, biz.longitude = _parse_coords_from_url(href)
+                # Keep only the canonical place path, drop query params
+                biz.google_maps_url = re.sub(r"\?.*$", "", href)
 
         # --- Rating / Reviews -----------------------------------------------
         biz.rating = _parse_rating(card_element)
@@ -379,6 +402,58 @@ CITY_BBOXES: Dict[str, Dict[str, float]] = {
     "culiacan":        {"lat_min": 24.74, "lat_max": 24.88, "lon_min": -107.50, "lon_max": -107.35},
     "chihuahua":       {"lat_min": 28.58, "lat_max": 28.75, "lon_min": -106.15, "lon_max": -105.97},
     "morelia":         {"lat_min": 19.65, "lat_max": 19.78, "lon_min": -101.25, "lon_max": -101.10},
+    # United Kingdom
+    "london":              {"lat_min": 51.28, "lat_max": 51.70, "lon_min": -0.51,   "lon_max":  0.33},
+    "manchester":          {"lat_min": 53.38, "lat_max": 53.55, "lon_min": -2.35,   "lon_max": -2.10},
+    "birmingham":          {"lat_min": 52.38, "lat_max": 52.57, "lon_min": -2.00,   "lon_max": -1.73},
+    "glasgow":             {"lat_min": 55.78, "lat_max": 55.92, "lon_min": -4.40,   "lon_max": -4.10},
+    "southampton":         {"lat_min": 50.87, "lat_max": 50.97, "lon_min": -1.48,   "lon_max": -1.32},
+    "liverpool":           {"lat_min": 53.32, "lat_max": 53.48, "lon_min": -3.05,   "lon_max": -2.83},
+    "bristol":             {"lat_min": 51.40, "lat_max": 51.53, "lon_min": -2.68,   "lon_max": -2.52},
+    "sheffield":           {"lat_min": 53.30, "lat_max": 53.47, "lon_min": -1.60,   "lon_max": -1.35},
+    "leeds":               {"lat_min": 53.72, "lat_max": 53.87, "lon_min": -1.70,   "lon_max": -1.45},
+    "edinburgh":           {"lat_min": 55.88, "lat_max": 56.00, "lon_min": -3.35,   "lon_max": -3.10},
+    "cardiff":             {"lat_min": 51.44, "lat_max": 51.55, "lon_min": -3.28,   "lon_max": -3.12},
+    "leicester":           {"lat_min": 52.58, "lat_max": 52.68, "lon_min": -1.20,   "lon_max": -1.05},
+    "stoke-on-trent":      {"lat_min": 52.98, "lat_max": 53.07, "lon_min": -2.22,   "lon_max": -2.10},
+    "hull":                {"lat_min": 53.72, "lat_max": 53.80, "lon_min": -0.40,   "lon_max": -0.25},
+    "plymouth":            {"lat_min": 50.35, "lat_max": 50.43, "lon_min": -4.18,   "lon_max": -4.05},
+    "nottingham":          {"lat_min": 52.90, "lat_max": 53.00, "lon_min": -1.22,   "lon_max": -1.08},
+    "bradford":            {"lat_min": 53.76, "lat_max": 53.85, "lon_min": -1.82,   "lon_max": -1.70},
+    "belfast":             {"lat_min": 54.55, "lat_max": 54.65, "lon_min": -6.05,   "lon_max": -5.85},
+    "portsmouth":          {"lat_min": 50.78, "lat_max": 50.85, "lon_min": -1.12,   "lon_max": -1.02},
+    "barnsley":            {"lat_min": 53.52, "lat_max": 53.58, "lon_min": -1.52,   "lon_max": -1.45},
+    "brighton and hove":   {"lat_min": 50.82, "lat_max": 50.88, "lon_min": -0.22,   "lon_max": -0.08},
+    "swindon":             {"lat_min": 51.53, "lat_max": 51.60, "lon_min": -1.83,   "lon_max": -1.72},
+    "derby":               {"lat_min": 52.88, "lat_max": 52.97, "lon_min": -1.55,   "lon_max": -1.43},
+    "sunderland":          {"lat_min": 54.88, "lat_max": 54.95, "lon_min": -1.45,   "lon_max": -1.35},
+    "wolverhampton":       {"lat_min": 52.56, "lat_max": 52.63, "lon_min": -2.17,   "lon_max": -2.07},
+    # France
+    "paris":               {"lat_min": 48.81, "lat_max": 48.91, "lon_min":  2.22,   "lon_max":  2.47},
+    "marseille":           {"lat_min": 43.17, "lat_max": 43.38, "lon_min":  5.25,   "lon_max":  5.52},
+    "lyon":                {"lat_min": 45.70, "lat_max": 45.82, "lon_min":  4.77,   "lon_max":  4.90},
+    "toulouse":            {"lat_min": 43.54, "lat_max": 43.67, "lon_min":  1.33,   "lon_max":  1.50},
+    "nice":                {"lat_min": 43.64, "lat_max": 43.74, "lon_min":  7.18,   "lon_max":  7.32},
+    "nantes":              {"lat_min": 47.18, "lat_max": 47.28, "lon_min": -1.63,   "lon_max": -1.48},
+    "bordeaux":            {"lat_min": 44.80, "lat_max": 44.90, "lon_min": -0.65,   "lon_max": -0.52},
+    "strasbourg":          {"lat_min": 48.53, "lat_max": 48.63, "lon_min":  7.67,   "lon_max":  7.82},
+    "montpellier":         {"lat_min": 43.57, "lat_max": 43.65, "lon_min":  3.82,   "lon_max":  3.93},
+    "lille":               {"lat_min": 50.60, "lat_max": 50.68, "lon_min":  3.02,   "lon_max":  3.12},
+    "rennes":              {"lat_min": 48.07, "lat_max": 48.14, "lon_min": -1.74,   "lon_max": -1.63},
+    "toulon":              {"lat_min": 43.10, "lat_max": 43.18, "lon_min":  5.87,   "lon_max":  5.98},
+    "rouen":               {"lat_min": 49.40, "lat_max": 49.48, "lon_min":  1.03,   "lon_max":  1.13},
+    "aix-en-provence":     {"lat_min": 43.50, "lat_max": 43.57, "lon_min":  5.38,   "lon_max":  5.50},
+    "clermont-ferrand":    {"lat_min": 45.75, "lat_max": 45.82, "lon_min":  3.05,   "lon_max":  3.14},
+    "saint-denis":         {"lat_min": 48.92, "lat_max": 48.96, "lon_min":  2.33,   "lon_max":  2.38},
+    "le mans":             {"lat_min": 47.98, "lat_max": 48.05, "lon_min":  0.17,   "lon_max":  0.25},
+    "nimes":               {"lat_min": 43.80, "lat_max": 43.87, "lon_min":  4.33,   "lon_max":  4.43},
+    "lyon-villeurbanne":   {"lat_min": 45.74, "lat_max": 45.78, "lon_min":  4.87,   "lon_max":  4.93},
+    "saint-etienne":       {"lat_min": 45.40, "lat_max": 45.48, "lon_min":  4.37,   "lon_max":  4.47},
+    "caen":                {"lat_min": 49.15, "lat_max": 49.22, "lon_min": -0.43,   "lon_max": -0.33},
+    "nancy":               {"lat_min": 48.67, "lat_max": 48.73, "lon_min":  6.15,   "lon_max":  6.22},
+    "orleans":             {"lat_min": 47.87, "lat_max": 47.93, "lon_min":  1.87,   "lon_max":  1.97},
+    "argenteuil":          {"lat_min": 48.93, "lat_max": 48.97, "lon_min":  2.23,   "lon_max":  2.29},
+    "montreuil":           {"lat_min": 48.85, "lat_max": 48.88, "lon_min":  2.43,   "lon_max":  2.47},
 }
 
 
