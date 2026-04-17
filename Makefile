@@ -38,7 +38,8 @@ test-short:
 
 .PHONY: scrape
 scrape:
-	$(PYTHON) scraper.py --city "$(CITY)" --country "$(COUNTRY)" --query "$(QUERY)"
+	$(PYTHON) scraper.py --city "$(CITY)" --country "$(COUNTRY)" --query "$(QUERY)" \
+		$(if $(PROXY),--proxy "$(PROXY)")
 
 # ---------------------------------------------------------------------------
 # Scraper – modo grid
@@ -46,12 +47,14 @@ scrape:
 
 .PHONY: scrape-grid
 scrape-grid:
-	$(PYTHON) scraper.py --grid --preset-city "$(CITY)" --query "$(QUERY)"
+	$(PYTHON) scraper.py --grid --preset-city "$(CITY)" --query "$(QUERY)" \
+		$(if $(PROXY),--proxy "$(PROXY)")
 
 .PHONY: scrape-grid-debug
 scrape-grid-debug:
 	$(PYTHON) scraper.py --grid --preset-city "$(CITY)" --query "$(QUERY)" \
-		--no-headless --rows 2 --cols 2
+		--no-headless --rows 2 --cols 2 \
+		$(if $(PROXY),--proxy "$(PROXY)")
 
 # ---------------------------------------------------------------------------
 # Limpieza

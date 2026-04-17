@@ -77,15 +77,23 @@ class BusinessInfo:
 # Dismiss Google consent / cookie dialogs before interacting
 JS_DISMISS_CONSENT = """
 (function() {
+    // Selector-based (most reliable)
     const selectors = [
+        '#L2AGLb',
+        'button[jsname="b3VHJd"]',
         'button[aria-label*="Accept"]',
         'button[aria-label*="Agree"]',
-        '#L2AGLb',            // "I agree" on google.com consent page
-        'button[jsname="b3VHJd"]',
+        '.sy4vM',
+        'button[jsname="higCR"]',
     ];
     for (const sel of selectors) {
         const btn = document.querySelector(sel);
-        if (btn) { btn.click(); return 'consent_dismissed'; }
+        if (btn) { btn.click(); return 'consent_dismissed:' + sel; }
+    }
+    // Text-based fallback (handles locale variations)
+    const pattern = /^(accept all|i agree|agree|accept|akzeptieren|tout accepter)$/i;
+    for (const btn of document.querySelectorAll('button, a[role="button"]')) {
+        if (pattern.test(btn.textContent.trim())) { btn.click(); return 'consent_dismissed:text'; }
     }
     return 'no_consent_found';
 })();
@@ -244,6 +252,94 @@ def _parse_website(element) -> Optional[str]:
             return href
 
     return None
+
+
+class _LocalProxyForwarder:
+    """
+    Minimal HTTP/CONNECT proxy that forwards to an authenticated upstream.
+
+    Chromium has a known issue where it fails to authenticate with proxies in
+    headless mode.  This forwarder listens on localhost (no auth required for
+    Chromium) and injects Proxy-Authorization when tunneling to the upstream.
+    """
+
+    LOCAL_PORT = 18888
+
+    def __init__(self, proxy_url: str):
+        import base64
+        from urllib.parse import urlparse
+        p = urlparse(proxy_url)
+        self._host = p.hostname
+        self._port = p.port
+        self._auth = (
+            b"Proxy-Authorization: Basic "
+            + base64.b64encode(f"{p.username}:{p.password}".encode())
+            + b"\r\n"
+        )
+        self._server = None
+
+    @property
+    def local_url(self) -> str:
+        return f"http://127.0.0.1:{self.LOCAL_PORT}"
+
+    async def start(self) -> None:
+        self._server = await asyncio.start_server(
+            self._handle, "127.0.0.1", self.LOCAL_PORT
+        )
+
+    def stop(self) -> None:
+        if self._server:
+            self._server.close()
+
+    async def _handle(self, client_r, client_w):
+        try:
+            first_line = await client_r.readline()
+            if not first_line:
+                return
+            headers: list[bytes] = []
+            while True:
+                line = await client_r.readline()
+                if line in (b"\r\n", b"\n", b""):
+                    break
+                headers.append(line)
+
+            up_r, up_w = await asyncio.open_connection(self._host, self._port)
+            up_w.write(first_line)
+            up_w.write(self._auth)
+            for h in headers:
+                if not h.lower().startswith(b"proxy-authorization"):
+                    up_w.write(h)
+            up_w.write(b"\r\n")
+            await up_w.drain()
+
+            resp = await up_r.readline()
+            client_w.write(resp)
+            while True:
+                line = await up_r.readline()
+                client_w.write(line)
+                if line in (b"\r\n", b"\n", b""):
+                    break
+            await client_w.drain()
+
+            await asyncio.gather(self._pipe(client_r, up_w), self._pipe(up_r, client_w))
+        except Exception:
+            pass
+        finally:
+            client_w.close()
+
+    @staticmethod
+    async def _pipe(src, dst):
+        try:
+            while chunk := await src.read(65536):
+                dst.write(chunk)
+                await dst.drain()
+        except Exception:
+            pass
+        finally:
+            try:
+                dst.close()
+            except Exception:
+                pass
 
 
 def _parse_coords_from_url(url: str) -> tuple[Optional[float], Optional[float]]:
@@ -511,6 +607,7 @@ class GoogleMapsScraper:
         max_results: Optional[int] = None,
         max_scroll_steps: int = 25,
         scroll_wait: float = 2.0,
+        proxy: Optional[str] = None,
     ):
         """
         Args:
@@ -518,11 +615,13 @@ class GoogleMapsScraper:
             max_results:      Stop after collecting this many businesses (None = unlimited).
             max_scroll_steps: Maximum number of manual scroll iterations as fallback.
             scroll_wait:      Base seconds to wait after each scroll for content to load.
+            proxy:            Proxy URL, e.g. "http://user:pass@host:port".
         """
         self.headless = headless
         self.max_results = max_results
         self.max_scroll_steps = max_scroll_steps
         self.scroll_wait = scroll_wait
+        self.proxy = proxy
         self._session_id = "gmaps_session"
 
     # ------------------------------------------------------------------
@@ -545,17 +644,22 @@ class GoogleMapsScraper:
         logger.info("Query  : %s in %s, %s", search_query, city, country)
         logger.info("URL    : %s", search_url)
 
+        forwarder, proxy_url = await self._start_forwarder()
         browser_cfg = BrowserConfig(
             headless=self.headless,
             verbose=False,
             viewport_width=1280,
             viewport_height=900,
             enable_stealth=True,
+            proxy=proxy_url,
         )
 
         seen_keys: set = set()
         async with AsyncWebCrawler(config=browser_cfg) as crawler:
             businesses = await self._scrape_single_tile(crawler, search_url, seen_keys)
+
+        if forwarder:
+            forwarder.stop()
 
         logger.info("=== Scraping complete – %d businesses collected ===", len(businesses))
         return businesses
@@ -598,13 +702,18 @@ class GoogleMapsScraper:
         logger.info("Query : %s", query)
         logger.info("BBox  : lat [%.4f, %.4f]  lon [%.4f, %.4f]", lat_min, lat_max, lon_min, lon_max)
         logger.info("Grid  : %d rows × %d cols = %d tiles  (zoom %d)", rows, cols, total_tiles, zoom)
+        if self.proxy:
+            safe_proxy = re.sub(r"://([^:]+:[^@]+)@", "://*****@", self.proxy)
+            logger.info("Proxy : %s", safe_proxy)
 
+        forwarder, proxy_url = await self._start_forwarder()
         browser_cfg = BrowserConfig(
             headless=self.headless,
             verbose=False,
             viewport_width=1280,
             viewport_height=900,
             enable_stealth=True,
+            proxy=proxy_url,
         )
 
         businesses: List[BusinessInfo] = []
@@ -640,6 +749,9 @@ class GoogleMapsScraper:
                 # Polite inter-tile pause to reduce bot-detection risk
                 await asyncio.sleep(random.uniform(1.0, 2.5))
 
+        if forwarder:
+            forwarder.stop()
+
         logger.info(
             "=== Grid complete – %d unique businesses across %d/%d tiles ===",
             len(businesses), tile_num, total_tiles,
@@ -649,6 +761,20 @@ class GoogleMapsScraper:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    async def _start_forwarder(self):
+        """Start the local proxy forwarder if a proxy URL is configured.
+
+        Returns (forwarder, proxy_url_for_browser). When no proxy is set,
+        returns (None, None).  Chromium connects to localhost:18888 (no auth)
+        and the forwarder injects credentials when tunneling upstream.
+        """
+        if not self.proxy:
+            return None, None
+        forwarder = _LocalProxyForwarder(self.proxy)
+        await forwarder.start()
+        logger.info("Local proxy forwarder started on %s", forwarder.local_url)
+        return forwarder, forwarder.local_url
 
     @staticmethod
     def _build_url(city: str, country: str, query: str) -> str:
@@ -699,9 +825,22 @@ class GoogleMapsScraper:
             wait_after_scroll=self.scroll_wait,
         )
 
+        # Wait for feed OR consent dialog — whichever comes first
+        wait_for_feed_or_consent = """js:() => {
+            if (document.querySelector('div[role="feed"]')) return true;
+            const hasFeed = document.querySelector('div[role="feed"]') !== null;
+            const hasConsent = ['#L2AGLb','button[jsname="b3VHJd"]','.sy4vM',
+                'button[jsname="higCR"]','button[aria-label*="Accept"]']
+                .some(s => document.querySelector(s));
+            const hasConsentText = [...document.querySelectorAll('button')]
+                .some(b => /^(accept all|i agree|agree|accept)$/i.test(b.textContent.trim()));
+            if (hasConsent || hasConsentText) return true;
+            return hasFeed;
+        }"""
+
         init_cfg = CrawlerRunConfig(
             session_id=self._session_id,
-            wait_for='css:div[role="feed"]',
+            wait_for=wait_for_feed_or_consent,
             js_code=[JS_DISMISS_CONSENT, JS_CLOSE_OVERLAYS],
             virtual_scroll_config=virtual_scroll,
             magic=True,
@@ -709,7 +848,7 @@ class GoogleMapsScraper:
             override_navigator=True,
             remove_consent_popups=True,
             cache_mode=CacheMode.BYPASS,
-            page_timeout=60_000,
+            page_timeout=120_000,
             delay_before_return_html=1.5,
             verbose=False,
         )
@@ -887,6 +1026,7 @@ async def run_scraper(
     search_query: str,
     max_results: Optional[int] = None,
     headless: bool = True,
+    proxy: Optional[str] = None,
     output_json: Optional[str] = None,
     output_csv: Optional[str] = None,
 ) -> List[BusinessInfo]:
@@ -904,6 +1044,7 @@ async def run_scraper(
     scraper = GoogleMapsScraper(
         headless=headless,
         max_results=max_results,
+        proxy=proxy,
     )
 
     businesses = await scraper.scrape(
@@ -932,6 +1073,7 @@ async def run_scraper_grid(
     zoom: int = 14,
     max_results: Optional[int] = None,
     headless: bool = True,
+    proxy: Optional[str] = None,
     city: Optional[str] = None,
     output_json: Optional[str] = None,
     output_csv: Optional[str] = None,
@@ -950,6 +1092,7 @@ async def run_scraper_grid(
     scraper = GoogleMapsScraper(
         headless=headless,
         max_results=max_results,
+        proxy=proxy,
     )
 
     businesses = await scraper.scrape_grid(
@@ -990,6 +1133,8 @@ if __name__ == "__main__":
                         help="Maximum number of businesses to collect (unlimited by default)")
     parser.add_argument("--no-headless", action="store_true",
                         help="Show the browser window (useful for debugging)")
+    parser.add_argument("--proxy", default=None,
+                        help='Proxy URL, e.g. "http://user:pass@host:port"')
     parser.add_argument("--output-json", default=None,
                         help="Path for JSON output (auto-generated if omitted)")
     parser.add_argument("--output-csv",  default=None,
@@ -1044,6 +1189,7 @@ if __name__ == "__main__":
                 zoom=args.zoom,
                 max_results=args.max_results,
                 headless=not args.no_headless,
+                proxy=args.proxy,
                 city=args.preset_city,
                 output_json=args.output_json,
                 output_csv=args.output_csv,
@@ -1060,6 +1206,7 @@ if __name__ == "__main__":
                 search_query=args.query,
                 max_results=args.max_results,
                 headless=not args.no_headless,
+                proxy=args.proxy,
                 output_json=args.output_json,
                 output_csv=args.output_csv,
             )
