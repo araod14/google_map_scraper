@@ -542,6 +542,18 @@ class TestBuildOutputFilenames:
         assert "taller_mecanico" in name
         assert "grid" in name
 
+    def test_grid_filename_with_city(self):
+        name = build_grid_output_filename("self storage facility", "csv", city="london")
+        assert name.endswith(".csv")
+        assert "self_storage_facility" in name
+        assert "london" in name
+        assert "grid" in name
+
+    def test_grid_filename_without_city(self):
+        name = build_grid_output_filename("self storage facility", "csv")
+        assert "london" not in name
+        assert "grid" in name
+
     def test_special_chars_removed(self):
         name = build_output_filename("São Paulo", "Brasil", "café & bar", "csv")
         assert "&" not in name

@@ -863,8 +863,12 @@ def build_output_filename(city: str, country: str, search_query: str, ext: str) 
     return name
 
 
-def build_grid_output_filename(search_query: str, ext: str) -> str:
-    """Build output filename for grid mode: <query>_grid_<date>.<ext>"""
+def build_grid_output_filename(search_query: str, ext: str, city: Optional[str] = None) -> str:
+    """Build output filename for grid mode.
+
+    With city:    <query>_<city>_grid_<date>.<ext>
+    Without city: <query>_grid_<date>.<ext>
+    """
     def slug(s: str) -> str:
         s = s.lower().strip()
         s = re.sub(r"[^\w\s-]", "", s)
@@ -872,6 +876,8 @@ def build_grid_output_filename(search_query: str, ext: str) -> str:
         return s
 
     date_str = datetime.now().strftime("%Y-%m-%d")
+    if city:
+        return f"{slug(search_query)}_{slug(city)}_grid_{date_str}.{ext}"
     return f"{slug(search_query)}_grid_{date_str}.{ext}"
 
 
@@ -926,18 +932,20 @@ async def run_scraper_grid(
     zoom: int = 14,
     max_results: Optional[int] = None,
     headless: bool = True,
+    city: Optional[str] = None,
     output_json: Optional[str] = None,
     output_csv: Optional[str] = None,
 ) -> List[BusinessInfo]:
     """
     Convenience wrapper for grid scraping: scrape and save results.
 
-    Output filenames default to <query>_grid_<YYYY-MM-DD>.{json,csv}.
+    Output filenames default to <query>_<city>_grid_<YYYY-MM-DD>.{json,csv}
+    when city is provided, or <query>_grid_<YYYY-MM-DD>.{json,csv} otherwise.
     """
     if output_json is None:
-        output_json = build_grid_output_filename(query, "json")
+        output_json = build_grid_output_filename(query, "json", city)
     if output_csv is None:
-        output_csv = build_grid_output_filename(query, "csv")
+        output_csv = build_grid_output_filename(query, "csv", city)
 
     scraper = GoogleMapsScraper(
         headless=headless,
@@ -1036,6 +1044,7 @@ if __name__ == "__main__":
                 zoom=args.zoom,
                 max_results=args.max_results,
                 headless=not args.no_headless,
+                city=args.preset_city,
                 output_json=args.output_json,
                 output_csv=args.output_csv,
             )
