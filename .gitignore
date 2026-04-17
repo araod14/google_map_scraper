@@ -4,7 +4,7 @@ __pycache__/
 *.pyo
 venv/
 .env
-
+pal formato/
 # Output files
 *.csv
 *.json
