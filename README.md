@@ -1,12 +1,47 @@
 # Google Maps Scraper
 
-Scraper de negocios en Google Maps usando [crawl4ai](https://github.com/unclecode/crawl4ai) con Playwright. Extrae nombre, rating, reseñas, categoría, dirección, teléfono y sitio web.
+Scraper de negocios en Google Maps usando [crawl4ai](https://github.com/unclecode/crawl4ai) con Playwright. Extrae nombre, rating, reseñas, categoría, dirección, teléfono, sitio web y coordenadas GPS.
 
 ## Instalación
 
 ```bash
-pip install crawl4ai beautifulsoup4 lxml
-playwright install chromium
+# Crea el entorno virtual e instala dependencias
+make install
+
+# Con dependencias de desarrollo (incluye pytest)
+make install-dev
+```
+
+> Sin Make: `pip install -r requirements.txt && playwright install chromium`
+
+## Makefile
+
+| Comando | Descripción |
+|---------|-------------|
+| `make install` | Crea venv e instala dependencias de producción |
+| `make install-dev` | Crea venv e instala dependencias + pytest |
+| `make test` | Corre todos los tests con output detallado |
+| `make test-short` | Corre los tests mostrando solo el resumen |
+| `make scrape CITY="..." COUNTRY="..." QUERY="..."` | Scraping en modo simple |
+| `make scrape-grid CITY="..." QUERY="..."` | Scraping en modo grid con ciudad predefinida |
+| `make scrape-grid-debug CITY="..." QUERY="..."` | Grid debug: 2×2 tiles con browser visible |
+| `make clean` | Elimina `__pycache__` y archivos `.pyc` |
+| `make clean-results` | Elimina los archivos `.json` y `.csv` generados |
+
+### Ejemplos
+
+```bash
+# Correr los tests
+make test
+
+# Scraping simple
+make scrape CITY="Guadalajara" COUNTRY="Mexico" QUERY="reparacion automotriz"
+
+# Scraping grid con ciudad predefinida
+make scrape-grid CITY="guadalajara" QUERY="reparacion automotriz"
+
+# Debug con browser visible (2×2 tiles)
+make scrape-grid-debug CITY="paris" QUERY="restaurants"
 ```
 
 ## Modos de uso
@@ -69,17 +104,95 @@ python scraper.py --grid --preset-city guadalajara --query "reparacion automotri
 
 ## Ciudades predefinidas
 
-| `--preset-city` | Área cubierta |
-|-----------------|---------------|
-| `guadalajara` | Zona Metropolitana de Guadalajara |
-| `monterrey` | Zona Metropolitana de Monterrey |
+### México
+
+| `--preset-city` | Ciudad |
+|-----------------|--------|
+| `guadalajara` | Guadalajara |
+| `monterrey` | Monterrey |
 | `mexico city` | Ciudad de México |
+| `ciudad de mexico` | Ciudad de México (alias) |
 | `tijuana` | Tijuana |
 | `puebla` | Puebla |
+| `toluca` | Toluca |
+| `leon` | León |
+| `juarez` | Ciudad Juárez |
+| `torreon` | Torreón |
+| `queretaro` | Querétaro |
+| `san luis potosi` | San Luis Potosí |
+| `merida` | Mérida |
+| `mexicali` | Mexicali |
+| `aguascalientes` | Aguascalientes |
+| `cuernavaca` | Cuernavaca |
+| `saltillo` | Saltillo |
+| `hermosillo` | Hermosillo |
+| `culiacan` | Culiacán |
+| `chihuahua` | Chihuahua |
+| `morelia` | Morelia |
+
+### Reino Unido
+
+| `--preset-city` | Ciudad |
+|-----------------|--------|
+| `london` | Londres |
+| `manchester` | Manchester |
+| `birmingham` | Birmingham |
+| `glasgow` | Glasgow |
+| `southampton` | Southampton |
+| `liverpool` | Liverpool |
+| `bristol` | Bristol |
+| `sheffield` | Sheffield |
+| `leeds` | Leeds |
+| `edinburgh` | Edimburgo |
+| `cardiff` | Cardiff |
+| `leicester` | Leicester |
+| `stoke-on-trent` | Stoke-on-Trent |
+| `hull` | Hull |
+| `plymouth` | Plymouth |
+| `nottingham` | Nottingham |
+| `bradford` | Bradford |
+| `belfast` | Belfast |
+| `portsmouth` | Portsmouth |
+| `barnsley` | Barnsley |
+| `brighton and hove` | Brighton and Hove |
+| `swindon` | Swindon |
+| `derby` | Derby |
+| `sunderland` | Sunderland |
+| `wolverhampton` | Wolverhampton |
+
+### Francia
+
+| `--preset-city` | Ciudad |
+|-----------------|--------|
+| `paris` | París |
+| `marseille` | Marsella |
+| `lyon` | Lyon |
+| `toulouse` | Toulouse |
+| `nice` | Niza |
+| `nantes` | Nantes |
+| `bordeaux` | Burdeos |
+| `strasbourg` | Estrasburgo |
+| `montpellier` | Montpellier |
+| `lille` | Lille |
+| `rennes` | Rennes |
+| `toulon` | Toulon |
+| `rouen` | Ruán |
+| `aix-en-provence` | Aix-en-Provence |
+| `clermont-ferrand` | Clermont-Ferrand |
+| `saint-denis` | Saint-Denis |
+| `le mans` | Le Mans |
+| `nimes` | Nîmes |
+| `lyon-villeurbanne` | Lyon–Villeurbanne |
+| `saint-etienne` | Saint-Étienne |
+| `caen` | Caen |
+| `nancy` | Nancy |
+| `orleans` | Orléans |
+| `argenteuil` | Argenteuil |
+| `montreuil` | Montreuil |
 
 Para agregar una ciudad nueva, edita el diccionario `CITY_BBOXES` en `scraper.py`:
 ```python
-"leon": {"lat_min": 21.05, "lat_max": 21.20, "lon_min": -101.75, "lon_max": -101.60},
+"mi ciudad": {"lat_min": 19.00, "lat_max": 19.20, "lon_min": -99.50, "lon_max": -99.30},
 ```
 
 ## Archivos de salida
