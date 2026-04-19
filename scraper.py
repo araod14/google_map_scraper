@@ -277,6 +277,26 @@ class _LocalProxyForwarder:
             + b"\r\n"
         )
         self._server = None
+        self.bytes_sent = 0      # browser → upstream (requests)
+        self.bytes_recv = 0      # upstream → browser (responses)
+
+    @property
+    def total_bytes(self) -> int:
+        return self.bytes_sent + self.bytes_recv
+
+    @property
+    def total_mb(self) -> float:
+        return self.total_bytes / (1024 * 1024)
+
+    def log_usage(self, label: str = "") -> None:
+        prefix = f"[{label}] " if label else ""
+        logger.info(
+            "%sProxy usage — sent: %.2f MB | recv: %.2f MB | total: %.2f MB",
+            prefix,
+            self.bytes_sent / (1024 * 1024),
+            self.bytes_recv / (1024 * 1024),
+            self.total_mb,
+        )
 
     @property
     def local_url(self) -> str:
@@ -321,16 +341,23 @@ class _LocalProxyForwarder:
                     break
             await client_w.drain()
 
-            await asyncio.gather(self._pipe(client_r, up_w), self._pipe(up_r, client_w))
+            await asyncio.gather(
+                self._pipe(client_r, up_w, self, "sent"),
+                self._pipe(up_r, client_w, self, "recv"),
+            )
         except Exception:
             pass
         finally:
             client_w.close()
 
     @staticmethod
-    async def _pipe(src, dst):
+    async def _pipe(src, dst, counter: "_LocalProxyForwarder", direction: str):
         try:
             while chunk := await src.read(65536):
+                if direction == "sent":
+                    counter.bytes_sent += len(chunk)
+                else:
+                    counter.bytes_recv += len(chunk)
                 dst.write(chunk)
                 await dst.drain()
         except Exception:
@@ -605,23 +632,35 @@ class GoogleMapsScraper:
         self,
         headless: bool = True,
         max_results: Optional[int] = None,
-        max_scroll_steps: int = 25,
-        scroll_wait: float = 2.0,
+        max_scroll_steps: int = 8,
+        scroll_wait: float = 1.5,
         proxy: Optional[str] = None,
+        phase2_threshold: int = 3,
+        tile_stale_limit: int = 6,
+        tile_timeout: float = 240,
     ):
         """
         Args:
-            headless:         Run browser without a visible window.
-            max_results:      Stop after collecting this many businesses (None = unlimited).
-            max_scroll_steps: Maximum number of manual scroll iterations as fallback.
-            scroll_wait:      Base seconds to wait after each scroll for content to load.
-            proxy:            Proxy URL, e.g. "http://user:pass@host:port".
+            headless:          Run browser without a visible window.
+            max_results:       Stop after collecting this many businesses (None = unlimited).
+            max_scroll_steps:  Maximum scroll iterations per phase per tile.
+            scroll_wait:       Base seconds to wait after each scroll for content to load.
+            proxy:             Proxy URL, e.g. "http://user:pass@host:port".
+            phase2_threshold:  Skip Phase 2 if Phase 1 already found this many new results.
+                               Saves proxy bandwidth when Phase 1 is working well.
+            tile_stale_limit:  Stop the grid after this many consecutive tiles that yield
+                               zero new results (coverage saturated).
+            tile_timeout:      Max seconds to wait for a single tile before skipping it.
+                               Prevents a hung Playwright call from blocking the run overnight.
         """
         self.headless = headless
         self.max_results = max_results
         self.max_scroll_steps = max_scroll_steps
         self.scroll_wait = scroll_wait
         self.proxy = proxy
+        self.phase2_threshold = phase2_threshold
+        self.tile_stale_limit = tile_stale_limit
+        self.tile_timeout = tile_timeout
         self._session_id = "gmaps_session"
 
     # ------------------------------------------------------------------
@@ -659,6 +698,7 @@ class GoogleMapsScraper:
             businesses = await self._scrape_single_tile(crawler, search_url, seen_keys)
 
         if forwarder:
+            forwarder.log_usage("RESUMEN FINAL")
             forwarder.stop()
 
         logger.info("=== Scraping complete – %d businesses collected ===", len(businesses))
@@ -674,6 +714,8 @@ class GoogleMapsScraper:
         rows: int = 8,
         cols: int = 10,
         zoom: int = 14,
+        checkpoint_fn: Optional[Any] = None,
+        checkpoint_every: int = 10,
     ) -> List[BusinessInfo]:
         """
         Scrape Google Maps using a grid of coordinate-anchored tiles.
@@ -719,37 +761,85 @@ class GoogleMapsScraper:
         businesses: List[BusinessInfo] = []
         seen_keys: set = set()
         start_time = time.monotonic()
+        consecutive_empty = 0
+        tile_num = 0
 
-        async with AsyncWebCrawler(config=browser_cfg) as crawler:
-            for tile_num, (center_lat, center_lng) in enumerate(
-                generate_grid_cells(lat_min, lat_max, lon_min, lon_max, rows, cols), 1
-            ):
-                tile_url = self._build_grid_url(center_lat, center_lng, zoom, query)
-                logger.info(
-                    "── Tile %d/%d  (%.5f, %.5f)  unique so far: %d",
-                    tile_num, total_tiles, center_lat, center_lng, len(businesses),
-                )
+        try:
+            async with AsyncWebCrawler(config=browser_cfg) as crawler:
+                for tile_num, (center_lat, center_lng) in enumerate(
+                    generate_grid_cells(lat_min, lat_max, lon_min, lon_max, rows, cols), 1
+                ):
+                    tile_url = self._build_grid_url(center_lat, center_lng, zoom, query)
+                    logger.info(
+                        "── Tile %d/%d  (%.5f, %.5f)  unique so far: %d",
+                        tile_num, total_tiles, center_lat, center_lng, len(businesses),
+                    )
 
-                new = await self._scrape_single_tile(crawler, tile_url, seen_keys)
-                businesses.extend(new)
+                    try:
+                        new = await asyncio.wait_for(
+                            self._scrape_single_tile(crawler, tile_url, seen_keys),
+                            timeout=self.tile_timeout,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "Tile %d/%d colgado por más de %.0fs – saltando.",
+                            tile_num, total_tiles, self.tile_timeout,
+                        )
+                        new = []
+                    businesses.extend(new)
 
-                elapsed = time.monotonic() - start_time
-                avg = elapsed / tile_num
-                eta_min = avg * (total_tiles - tile_num) / 60
-                logger.info(
-                    "   +%d nuevos | total: %d | ETA: ~%.0f min",
-                    len(new), len(businesses), eta_min,
-                )
+                    if len(new) == 0:
+                        consecutive_empty += 1
+                        logger.info(
+                            "   +0 nuevos | total: %d | tiles vacíos consecutivos: %d/%d",
+                            len(businesses), consecutive_empty, self.tile_stale_limit,
+                        )
+                        if consecutive_empty >= self.tile_stale_limit:
+                            logger.info(
+                                "Cobertura saturada (%d tiles consecutivos sin resultados nuevos) – deteniendo grid.",
+                                consecutive_empty,
+                            )
+                            break
+                    else:
+                        consecutive_empty = 0
+                        elapsed = time.monotonic() - start_time
+                        avg = elapsed / tile_num
+                        eta_min = avg * (total_tiles - tile_num) / 60
+                        logger.info(
+                            "   +%d nuevos | total: %d | ETA: ~%.0f min",
+                            len(new), len(businesses), eta_min,
+                        )
 
-                if self.max_results and len(businesses) >= self.max_results:
-                    businesses = businesses[: self.max_results]
-                    logger.info("Reached max_results (%d) – stopping grid.", self.max_results)
-                    break
+                    if forwarder:
+                        logger.info(
+                            "   proxy acumulado: %.2f MB (↑%.2f MB ↓%.2f MB)",
+                            forwarder.total_mb,
+                            forwarder.bytes_sent / (1024 * 1024),
+                            forwarder.bytes_recv / (1024 * 1024),
+                        )
 
-                # Polite inter-tile pause to reduce bot-detection risk
-                await asyncio.sleep(random.uniform(1.0, 2.5))
+                    if checkpoint_fn and tile_num % checkpoint_every == 0 and businesses:
+                        logger.info("Checkpoint – guardando %d resultados (tile %d) …", len(businesses), tile_num)
+                        checkpoint_fn(businesses)
+
+                    if self.max_results and len(businesses) >= self.max_results:
+                        businesses = businesses[: self.max_results]
+                        logger.info("Reached max_results (%d) – stopping grid.", self.max_results)
+                        break
+
+                    # Polite inter-tile pause to reduce bot-detection risk
+                    await asyncio.sleep(random.uniform(1.0, 2.5))
+
+        except KeyboardInterrupt:
+            logger.info(
+                "Interrupción manual (Ctrl+C) – guardando %d resultados parciales …",
+                len(businesses),
+            )
+            if checkpoint_fn and businesses:
+                checkpoint_fn(businesses)
 
         if forwarder:
+            forwarder.log_usage("RESUMEN FINAL")
             forwarder.stop()
 
         logger.info(
@@ -866,6 +956,11 @@ class GoogleMapsScraper:
         # ── Phase 2: Manual JS-scroll fallback ───────────────────────────
         if not self._should_continue(tile_businesses, result.html):
             logger.info("Phase 1 collected all available results. Skipping Phase 2.")
+        elif len(tile_businesses) >= self.phase2_threshold:
+            logger.info(
+                "Phase 1 found %d results (≥ threshold %d) – skipping Phase 2 to save proxy.",
+                len(tile_businesses), self.phase2_threshold,
+            )
         else:
             logger.info("Phase 2 – Manual scroll loop to catch remaining results …")
             tile_businesses = await self._manual_scroll_loop(
@@ -907,7 +1002,34 @@ class GoogleMapsScraper:
             result = await crawler.arun(url=search_url, config=scroll_cfg)
 
             if not result.success:
-                logger.warning("Scroll step %d failed: %s", step, result.error_message)
+                err = result.error_message or ""
+                logger.warning("Scroll step %d failed: %s", step, err)
+
+                # Browser session died (closed tab/context) — attempt full reload to recover
+                if "has been closed" in err or "Target closed" in err or "Session closed" in err:
+                    logger.info("Browser session lost – attempting full page reload to recover …")
+                    reload_cfg = CrawlerRunConfig(
+                        session_id=self._session_id,
+                        js_code=[JS_DISMISS_CONSENT, JS_CLOSE_OVERLAYS],
+                        cache_mode=CacheMode.BYPASS,
+                        page_timeout=60_000,
+                        delay_before_return_html=self.scroll_wait,
+                        verbose=False,
+                    )
+                    try:
+                        recovery = await crawler.arun(url=search_url, config=reload_cfg)
+                        if recovery.success:
+                            logger.info("Session recovered – continuing scroll loop.")
+                            new = extract_businesses_from_html(recovery.html, seen_keys)
+                            businesses.extend(new)
+                            prev_total = len(businesses)
+                            stale_streak = 0
+                            continue
+                    except Exception as exc:
+                        logger.warning("Recovery attempt failed: %s", exc)
+                    logger.warning("Could not recover browser session – stopping scroll loop.")
+                    break
+
                 stale_streak += 1
                 if stale_streak >= self.STALE_STREAK_LIMIT:
                     logger.info("Too many consecutive failures – stopping scroll loop.")
@@ -1077,6 +1199,10 @@ async def run_scraper_grid(
     city: Optional[str] = None,
     output_json: Optional[str] = None,
     output_csv: Optional[str] = None,
+    max_scroll_steps: int = 8,
+    phase2_threshold: int = 3,
+    tile_stale_limit: int = 6,
+    tile_timeout: float = 240,
 ) -> List[BusinessInfo]:
     """
     Convenience wrapper for grid scraping: scrape and save results.
@@ -1093,7 +1219,15 @@ async def run_scraper_grid(
         headless=headless,
         max_results=max_results,
         proxy=proxy,
+        max_scroll_steps=max_scroll_steps,
+        phase2_threshold=phase2_threshold,
+        tile_stale_limit=tile_stale_limit,
+        tile_timeout=tile_timeout,
     )
+
+    def _checkpoint(biz: List[BusinessInfo]) -> None:
+        save_to_json(biz, output_json)
+        save_to_csv(biz, output_csv)
 
     businesses = await scraper.scrape_grid(
         query=query,
@@ -1104,6 +1238,8 @@ async def run_scraper_grid(
         rows=rows,
         cols=cols,
         zoom=zoom,
+        checkpoint_fn=_checkpoint,
+        checkpoint_every=10,
     )
 
     if businesses:
@@ -1163,6 +1299,14 @@ if __name__ == "__main__":
                         help="Grid columns – west-to-east divisions  [grid mode]")
     parser.add_argument("--zoom", type=int, default=14,
                         help="Google Maps zoom level (13≈5km, 14≈2.5km visible diameter)  [grid mode]")
+    parser.add_argument("--max-scroll-steps", type=int, default=8,
+                        help="Max scroll iterations per phase per tile (lower = less proxy usage)")
+    parser.add_argument("--phase2-threshold", type=int, default=3,
+                        help="Skip Phase 2 if Phase 1 already found this many new results per tile")
+    parser.add_argument("--tile-stale-limit", type=int, default=6,
+                        help="Stop grid after this many consecutive tiles with zero new results")
+    parser.add_argument("--tile-timeout", type=float, default=240,
+                        help="Max seconds per tile before skipping it (prevents overnight hangs)")
 
     args = parser.parse_args()
 
@@ -1193,6 +1337,10 @@ if __name__ == "__main__":
                 city=args.preset_city,
                 output_json=args.output_json,
                 output_csv=args.output_csv,
+                max_scroll_steps=args.max_scroll_steps,
+                phase2_threshold=args.phase2_threshold,
+                tile_stale_limit=args.tile_stale_limit,
+                tile_timeout=args.tile_timeout,
             )
         )
     else:
