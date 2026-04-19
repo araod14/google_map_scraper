@@ -369,6 +369,69 @@ class _LocalProxyForwarder:
                 pass
 
 
+class _NetworkStats:
+    """
+    Measures cumulative network bytes using /proc/net/dev (Linux) or psutil.
+    Used when no proxy forwarder is active, to still report bandwidth usage.
+    Measures all interfaces combined minus loopback.
+    """
+
+    def __init__(self):
+        s, r = self._read()
+        self._base_sent = s
+        self._base_recv = r
+
+    @staticmethod
+    def _read() -> tuple[int, int]:
+        try:
+            import psutil
+            c = psutil.net_io_counters()
+            return c.bytes_sent, c.bytes_recv
+        except ImportError:
+            pass
+        try:
+            sent = recv = 0
+            with open("/proc/net/dev") as fh:
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) < 10 or not parts[0].endswith(":"):
+                        continue
+                    iface = parts[0].rstrip(":")
+                    if iface == "lo":
+                        continue
+                    recv += int(parts[1])
+                    sent += int(parts[9])
+            return sent, recv
+        except OSError:
+            return 0, 0
+
+    @property
+    def bytes_sent(self) -> int:
+        return max(0, self._read()[0] - self._base_sent)
+
+    @property
+    def bytes_recv(self) -> int:
+        return max(0, self._read()[1] - self._base_recv)
+
+    @property
+    def total_bytes(self) -> int:
+        return self.bytes_sent + self.bytes_recv
+
+    @property
+    def total_mb(self) -> float:
+        return self.total_bytes / (1024 * 1024)
+
+    def log_usage(self, label: str = "") -> None:
+        prefix = f"[{label}] " if label else ""
+        logger.info(
+            "%sNetwork usage — sent: %.2f MB | recv: %.2f MB | total: %.2f MB",
+            prefix,
+            self.bytes_sent / (1024 * 1024),
+            self.bytes_recv / (1024 * 1024),
+            self.total_mb,
+        )
+
+
 def _parse_coords_from_url(url: str) -> tuple[Optional[float], Optional[float]]:
     """Extract (latitude, longitude) from a Google Maps place URL.
 
@@ -684,6 +747,7 @@ class GoogleMapsScraper:
         logger.info("URL    : %s", search_url)
 
         forwarder, proxy_url = await self._start_forwarder()
+        net_stats = forwarder if forwarder else _NetworkStats()
         browser_cfg = BrowserConfig(
             headless=self.headless,
             verbose=False,
@@ -697,8 +761,8 @@ class GoogleMapsScraper:
         async with AsyncWebCrawler(config=browser_cfg) as crawler:
             businesses = await self._scrape_single_tile(crawler, search_url, seen_keys)
 
+        net_stats.log_usage("RESUMEN FINAL")
         if forwarder:
-            forwarder.log_usage("RESUMEN FINAL")
             forwarder.stop()
 
         logger.info("=== Scraping complete – %d businesses collected ===", len(businesses))
@@ -749,6 +813,7 @@ class GoogleMapsScraper:
             logger.info("Proxy : %s", safe_proxy)
 
         forwarder, proxy_url = await self._start_forwarder()
+        net_stats = forwarder if forwarder else _NetworkStats()
         browser_cfg = BrowserConfig(
             headless=self.headless,
             verbose=False,
@@ -810,13 +875,12 @@ class GoogleMapsScraper:
                             len(new), len(businesses), eta_min,
                         )
 
-                    if forwarder:
-                        logger.info(
-                            "   proxy acumulado: %.2f MB (↑%.2f MB ↓%.2f MB)",
-                            forwarder.total_mb,
-                            forwarder.bytes_sent / (1024 * 1024),
-                            forwarder.bytes_recv / (1024 * 1024),
-                        )
+                    logger.info(
+                        "   red acumulada: %.2f MB (↑%.2f MB ↓%.2f MB)",
+                        net_stats.total_mb,
+                        net_stats.bytes_sent / (1024 * 1024),
+                        net_stats.bytes_recv / (1024 * 1024),
+                    )
 
                     if checkpoint_fn and tile_num % checkpoint_every == 0 and businesses:
                         logger.info("Checkpoint – guardando %d resultados (tile %d) …", len(businesses), tile_num)
@@ -838,8 +902,8 @@ class GoogleMapsScraper:
             if checkpoint_fn and businesses:
                 checkpoint_fn(businesses)
 
+        net_stats.log_usage("RESUMEN FINAL")
         if forwarder:
-            forwarder.log_usage("RESUMEN FINAL")
             forwarder.stop()
 
         logger.info(
