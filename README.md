@@ -25,6 +25,7 @@ make install-dev
 | `make scrape CITY="..." COUNTRY="..." QUERY="..."` | Scraping en modo simple |
 | `make scrape-grid CITY="..." QUERY="..."` | Scraping en modo grid con ciudad predefinida |
 | `make scrape-grid-debug CITY="..." QUERY="..."` | Grid debug: 2×2 tiles con browser visible |
+| `make scrape-grid-batch QUERY="..."` | Batch: scraping en múltiples ciudades secuencialmente |
 | `make clean` | Elimina `__pycache__` y archivos `.pyc` |
 | `make clean-results` | Elimina los archivos `.json` y `.csv` generados |
 
@@ -42,6 +43,9 @@ make scrape-grid CITY="guadalajara" QUERY="reparacion automotriz"
 
 # Debug con browser visible (2×2 tiles)
 make scrape-grid-debug CITY="paris" QUERY="restaurants"
+
+# Batch: múltiples ciudades
+make scrape-grid-batch QUERY="reparacion automotriz"
 ```
 
 ## Modos de uso
@@ -84,23 +88,55 @@ python scraper.py --grid --preset-city guadalajara --query "reparacion automotri
   --no-headless --rows 2 --cols 2
 ```
 
+### Modo batch (múltiples ciudades)
+
+Ejecuta el scraping en todas las ciudades predefinidas de forma secuencial:
+
+```bash
+python run_grid_batch.py "reparacion automotriz"
+```
+
+### Post-procesado: agregar código postal
+
+Enriquece los resultados con el código postal via reverse-geocoding de Nominatim (OpenStreetMap):
+
+```bash
+python enrich_zipcode.py input.json output.json
+```
+
 ## Opciones
+
+**Opciones compartidas (todos los modos):**
 
 | Argumento | Descripción | Default |
 |-----------|-------------|---------|
 | `--query` | Término de búsqueda | requerido |
-| `--city` | Ciudad *(solo modo simple)* | requerido en modo simple |
-| `--country` | País *(solo modo simple)* | requerido en modo simple |
-| `--grid` | Activar modo grid | — |
+| `--max-results` | Límite total de resultados | sin límite |
+| `--no-headless` | Mostrar el browser (útil para debug) | — |
+| `--proxy URL` | Proxy HTTP `http://user:pass@host:port` | — |
+| `--output-json` | Ruta del archivo JSON | auto-generada |
+| `--output-csv` | Ruta del archivo CSV | auto-generada |
+
+**Solo modo simple:**
+
+| Argumento | Descripción | Default |
+|-----------|-------------|---------|
+| `--city` | Ciudad | requerido |
+| `--country` | País | requerido |
+
+**Solo modo grid (`--grid`):**
+
+| Argumento | Descripción | Default |
+|-----------|-------------|---------|
 | `--preset-city` | Ciudad predefinida *(ver tabla abajo)* | — |
 | `--bbox LAT_MIN LAT_MAX LON_MIN LON_MAX` | Bounding box personalizada | — |
 | `--rows` | Filas de la cuadrícula (norte→sur) | `8` |
 | `--cols` | Columnas de la cuadrícula (oeste→este) | `10` |
 | `--zoom` | Zoom de Maps (13≈5km, 14≈2.5km por tile) | `14` |
-| `--max-results` | Límite total de resultados | sin límite |
-| `--no-headless` | Mostrar el browser (útil para debug) | — |
-| `--output-json` | Ruta del archivo JSON | auto-generada |
-| `--output-csv` | Ruta del archivo CSV | auto-generada |
+| `--max-scroll-steps` | Máximo de iteraciones de scroll por fase por tile | `8` |
+| `--phase2-threshold` | Omitir Phase 2 si Phase 1 encontró ≥ N resultados | `3` |
+| `--tile-stale-limit` | Detener grid tras N tiles vacíos consecutivos | `6` |
+| `--tile-timeout` | Tiempo máximo en segundos por tile | `240` |
 
 ## Ciudades predefinidas
 
@@ -202,7 +238,8 @@ Los archivos se generan automáticamente con la fecha actual:
 | Modo | Ejemplo |
 |------|---------|
 | Simple | `reparacion_automotriz_guadalajara_mexico_2026-03-25.json` |
-| Grid | `reparacion_automotriz_grid_2026-03-25.json` |
+| Grid con ciudad | `reparacion_automotriz_guadalajara_grid_2026-03-25.json` |
+| Grid sin ciudad | `reparacion_automotriz_grid_2026-03-25.json` |
 
 Cada registro contiene:
 
