@@ -209,6 +209,9 @@ def _parse_category_and_address(element) -> tuple[Optional[str], Optional[str]]:
             # Skip parenthesised review counts "(320)"
             if re.match(r"^\([\d,]+\)$", part):
                 continue
+            # Skip opening hours strings (e.g. "Abre a las 10 a.m.", "Open until 9 p.m.")
+            if re.search(r'\b(abre|cierra|opens?|closes?|abierto|cerrado|a\.m\.|p\.m\.)\b', part, re.I):
+                continue
             # Category: no digits, short, likely a business-type label
             if category is None and not re.search(r"\d", part):
                 category = part
@@ -223,9 +226,12 @@ def _parse_category_and_address(element) -> tuple[Optional[str], Optional[str]]:
 
 def _parse_phone(element) -> Optional[str]:
     """Look for a phone number string inside the card."""
-    # Common international + local phone patterns
-    phone_re = re.compile(r"^\+?[\d][\d\s\-\(\).]{6,}$")
+    # tel: href links (most reliable — present in detail view)
+    for a in element.find_all("a", href=re.compile(r"^tel:")):
+        return a["href"].replace("tel:", "").strip()
 
+    # Common international + local phone patterns in text nodes
+    phone_re = re.compile(r"^\+?[\d][\d\s\-\(\).]{6,}$")
     for tag in element.find_all(string=phone_re):
         return tag.strip()
 
@@ -240,6 +246,11 @@ def _parse_phone(element) -> Optional[str]:
 
 def _parse_website(element) -> Optional[str]:
     """Extract the website URL from a card if present."""
+    # data-item-id="authority" — used in detail view
+    el = element.select_one('a[data-item-id="authority"]')
+    if el:
+        return el.get("href")
+
     # Explicit data-value="Website" link
     el = element.select_one('a[data-value="Website"]')
     if el:
@@ -252,6 +263,61 @@ def _parse_website(element) -> Optional[str]:
             return href
 
     return None
+
+
+def _parse_detail_for_contact(html: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Parse phone, website and address from a Google Maps business detail page."""
+    soup = BeautifulSoup(html, "lxml")
+
+    phone: Optional[str] = None
+    website: Optional[str] = None
+    address: Optional[str] = None
+
+    # Phone: tel: href (most reliable)
+    for a in soup.find_all("a", href=re.compile(r"^tel:")):
+        phone = a["href"].replace("tel:", "").strip()
+        break
+
+    # Phone fallback: aria-label
+    if not phone:
+        for tag in soup.find_all(attrs={"aria-label": re.compile(r"phone|tel", re.I)}):
+            m = re.search(r"[\+\d][\d\s\-\(\).]{6,}", tag.get("aria-label", ""))
+            if m:
+                phone = m.group().strip()
+                break
+
+    # Website: data-item-id="authority"
+    el = soup.select_one('a[data-item-id="authority"]')
+    if el:
+        website = el.get("href")
+
+    # Website fallback: any outbound non-Google link
+    if not website:
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href.startswith("http") and "google" not in href and "goo.gl" not in href:
+                website = href
+                break
+
+    # Address: button/div with data-item-id="address", or aria-label starting with address
+    el = soup.select_one('[data-item-id="address"]')
+    if el:
+        address = el.get_text(strip=True)
+
+    if not address:
+        for tag in soup.find_all(attrs={"aria-label": re.compile(r"^address[:\s]", re.I)}):
+            address = re.sub(r"^address[:\s]*", "", tag["aria-label"], flags=re.I).strip()
+            break
+
+    # Fallback: look for a copy-address button whose aria-label contains the address text
+    if not address:
+        for tag in soup.find_all(attrs={"data-tooltip": re.compile(r"address", re.I)}):
+            txt = tag.get_text(strip=True)
+            if txt and len(txt) > 5:
+                address = txt
+                break
+
+    return phone, website, address
 
 
 class _LocalProxyForwarder:
@@ -912,6 +978,50 @@ class GoogleMapsScraper:
         )
         return businesses
 
+    async def enrich_with_details(self, businesses: List[BusinessInfo]) -> None:
+        """Open a browser session and visit each business detail page to fill phone/website."""
+        targets = [b for b in businesses if (not b.phone or not b.website) and b.google_maps_url]
+        logger.info("Enriching %d businesses with detail pages …", len(targets))
+
+        _, proxy_url = await self._start_forwarder()
+        browser_cfg = BrowserConfig(
+            headless=self.headless,
+            verbose=False,
+            viewport_width=1280,
+            viewport_height=900,
+            enable_stealth=True,
+            proxy=proxy_url,
+        )
+
+        async with AsyncWebCrawler(config=browser_cfg) as crawler:
+            for i, biz in enumerate(targets, 1):
+                try:
+                    cfg = CrawlerRunConfig(
+                        session_id="detail_session",
+                        js_code=[JS_DISMISS_CONSENT],
+                        cache_mode=CacheMode.BYPASS,
+                        page_timeout=30_000,
+                        delay_before_return_html=2.0,
+                        verbose=False,
+                    )
+                    result = await crawler.arun(url=biz.google_maps_url, config=cfg)
+                    if result.success:
+                        phone, website, address = _parse_detail_for_contact(result.html)
+                        if not biz.phone:
+                            biz.phone = phone
+                        if not biz.website:
+                            biz.website = website
+                        if not biz.address:
+                            biz.address = address
+                    logger.info(
+                        "Detail %d/%d  %-40s  phone=%s  web=%s",
+                        i, len(targets), (biz.name or "")[:40],
+                        biz.phone or "-", biz.website or "-",
+                    )
+                except Exception as exc:
+                    logger.debug("Detail scrape failed for %s: %s", biz.name, exc)
+                await asyncio.sleep(random.uniform(0.8, 1.8))
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -1215,6 +1325,7 @@ async def run_scraper(
     proxy: Optional[str] = None,
     output_json: Optional[str] = None,
     output_csv: Optional[str] = None,
+    enrich: bool = False,
 ) -> List[BusinessInfo]:
     """
     Convenience wrapper: scrape and save results.
@@ -1238,6 +1349,9 @@ async def run_scraper(
         country=country,
         search_query=search_query,
     )
+
+    if enrich and businesses:
+        await scraper.enrich_with_details(businesses)
 
     if businesses:
         save_to_json(businesses, output_json)
@@ -1267,6 +1381,7 @@ async def run_scraper_grid(
     phase2_threshold: int = 3,
     tile_stale_limit: int = 6,
     tile_timeout: float = 240,
+    enrich: bool = False,
 ) -> List[BusinessInfo]:
     """
     Convenience wrapper for grid scraping: scrape and save results.
@@ -1306,6 +1421,12 @@ async def run_scraper_grid(
         checkpoint_every=10,
     )
 
+    if enrich and businesses:
+        logger.info("=== Enrichment phase: fetching phone/website for each business ===")
+        await scraper.enrich_with_details(businesses)
+        save_to_json(businesses, output_json)
+        save_to_csv(businesses, output_csv)
+
     if businesses:
         save_to_json(businesses, output_json)
         save_to_csv(businesses, output_csv)
@@ -1339,6 +1460,8 @@ if __name__ == "__main__":
                         help="Path for JSON output (auto-generated if omitted)")
     parser.add_argument("--output-csv",  default=None,
                         help="Path for CSV output  (auto-generated if omitted)")
+    parser.add_argument("--enrich", action="store_true",
+                        help="After collecting the list, visit each business page to get phone and website")
 
     # ── Single-search args (original mode) ───────────────────────────────
     parser.add_argument("--city",    default=None, help="City to search in  [single mode]")
@@ -1405,6 +1528,7 @@ if __name__ == "__main__":
                 phase2_threshold=args.phase2_threshold,
                 tile_stale_limit=args.tile_stale_limit,
                 tile_timeout=args.tile_timeout,
+                enrich=args.enrich,
             )
         )
     else:
@@ -1421,6 +1545,7 @@ if __name__ == "__main__":
                 proxy=args.proxy,
                 output_json=args.output_json,
                 output_csv=args.output_csv,
+                enrich=args.enrich,
             )
         )
 
